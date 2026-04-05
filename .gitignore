@@ -1,0 +1,10 @@
+# 後端忽略檔
+backend/school.db
+backend/__pycache__/
+backend/venv/
+backend/.env
+
+# 前端忽略檔
+frontend/node_modules/
+frontend/dist/
+frontend/.env
