@@ -56,26 +56,27 @@ const TeacherDashboard = () => {
 
   const handleLogout = () => { localStorage.removeItem('token'); navigate('/login'); };
 // 👇 新增這段修改密碼的函數 (升級為 Swal 漂亮彈窗版)
-  const requestPasswordReset = async () => {
+const requestPasswordReset = async () => {
     let email = localStorage.getItem('userEmail');
     
-    // 如果系統沒存到老師的 Email，就彈出視窗請老師手動輸入
     if (!email) {
       const { value: inputEmail } = await Swal.fire({
-        title: '請輸入您的登入 Email',
+        title: '請輸入您的教師 Email',
         input: 'email',
         inputPlaceholder: '例如: teacher@school.edu.tw',
         showCancelButton: true,
         confirmButtonText: '發送重設信',
         cancelButtonText: '取消'
       });
-      if (!inputEmail) return; // 按下取消就中斷
+      if (!inputEmail) return; 
       email = inputEmail;
     }
 
     try {
       await api.post('/forgot-password', { email });
-      Swal.fire('發送成功', '修改密碼信件已發送至您的信箱！請前往收信。', 'success');
+      // 新增：寫入 localStorage，讓登出後的 Login 頁面也能讀到 CD
+      localStorage.setItem('emailCooldownTime', Date.now().toString());
+      Swal.fire('發送成功', '密碼重設信件已發送至您的信箱，請前往查看。', 'success');
     } catch (error) {
       Swal.fire('發送失敗', error.response?.data?.msg || "發生錯誤，請稍後再試", 'error');
     }

@@ -107,9 +107,13 @@ def forgot_password():
 	user = User.query.filter_by(email=request.get_json().get('email')).first()
 	if user:
 		can_send, wait_time = check_and_update_email_cd(user)
-		if can_send: send_reset_email(user.email)
-	return jsonify({"msg": "若該信箱存在，系統已發送密碼重設信"}), 200
-
+		if not can_send:
+			# 攔截 CD，回傳 429 讓前端捕捉
+			return jsonify({"msg": f"發送太頻繁，請等待 {wait_time} 秒後再試"}), 429
+		send_reset_email(user.email)
+	
+	# 為了防範信箱枚舉攻擊，無論信箱存不存在都回傳 200
+	return jsonify({"msg": "如果該信箱存在，系統已寄出密碼重設信"}), 200
 @app.route('/set-password', methods=['POST'])
 @jwt_required()
 def set_password():

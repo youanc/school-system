@@ -44,11 +44,11 @@ const StudentDashboard = () => {
 // 👇 新增這段修改密碼的函數
   const requestPasswordReset = async () => {
     try {
-      // 學生端已經有 data.email 的狀態了，直接拿來用
       await api.post('/forgot-password', { email: data.email });
-      alert("修改密碼信件已發送至您的信箱！請前往收信。");
+      // 新增：寫入 localStorage，讓登出後的 Login 頁面也能讀到 CD
+      localStorage.setItem('emailCooldownTime', Date.now().toString());
+      alert("密碼重設信件已發送至您的信箱，請查看。");
     } catch (error) {
-      // 捕捉後端傳來的 60 秒冷卻提示或其他錯誤
       alert(error.response?.data?.msg || "發送失敗，請稍後再試");
     }
   };
