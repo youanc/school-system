@@ -34,6 +34,14 @@ bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 # ================= 資料庫模型 =================
 class User(db.Model):
 	id = db.Column(db.Integer, primary_key=True)
@@ -275,66 +283,152 @@ def update_student_grades(student_id, exam_id):
 @app.route('/teacher/import-grades', methods=['POST'])
 @jwt_required()
 def import_grades():
-	if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
-	if 'file' not in request.files: return jsonify({"msg": "請上傳檔案"}), 400
-	
-	file = request.files['file']
-	try:
-		# sheet_name=None 讀取所有工作表
-		sheets = pd.read_excel(file, sheet_name=None)
-		
-		for sheet_name, df in sheets.items():
-			exam = Exam.query.filter_by(name=sheet_name).first()
-			if not exam:
-				exam = Exam(name=sheet_name)
-				db.session.add(exam)
-				db.session.flush()
-			else:
-				# 【防呆】如果考試存在且已被鎖定，跳過這個 sheet 不匯入
-				if exam.is_locked:
-					continue
-			
-			# 清除該考試舊成績以利覆蓋
-			Score.query.filter_by(exam_id=exam.id).delete()
-			
-			for _, row in df.iterrows():
-				student_id_val = str(row.get('學號', '')).strip()
-				if student_id_val.endswith('.0'): student_id_val = student_id_val[:-2]
-				if len(student_id_val) < 3 and student_id_val.isdigit(): student_id_val = student_id_val.zfill(3)
+    if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
+    if 'file' not in request.files: return jsonify({"msg": "請上傳檔案"}), 400
+    
+    file = request.files['file']
+    try:
+        sheets = pd.read_excel(file, sheet_name=None)
+        total_inserted_scores = 0 
+        total_upserted_students = 0
+        deleted_count = 0 # 新增：記錄刪除了多少舊生
+        
+        # 步驟 1：優先處理「學生名單」Sheet (如果存在)
+        if '學生名單' in sheets:
+            df_students = sheets['學生名單']
+            excel_student_ids = [] # 新增：用來記錄這份 Excel 裡面「有效」的學號
+            
+            for _, row in df_students.iterrows():
+                s_id = str(row.get('學號', '')).strip()
+                if s_id.endswith('.0'): s_id = s_id[:-2]
+                if len(s_id) < 3 and s_id.isdigit(): s_id = s_id.zfill(3)
+                
+                email = str(row.get('Email', '')).strip()
+                name = str(row.get('姓名', '')).strip()
+                
+                # 若缺少必填欄位則跳過
+                if not s_id or not email or pd.isna(email) or not name or pd.isna(name):
+                    continue
+                    
+                excel_student_ids.append(s_id) # 收集 Excel 裡的學號
+                
+                student = User.query.filter_by(student_id=s_id, role='student').first()
+                if not student:
+                    if not User.query.filter_by(email=email).first():
+                        student = User(student_id=s_id, email=email, name=name, role='student', is_verified=False)
+                        db.session.add(student)
+                        total_upserted_students += 1
+                else:
+                    if student.email != email and not User.query.filter_by(email=email).first():
+                        student.email = email
+                    student.name = name
+                    total_upserted_students += 1
+            
+            # 【關鍵修改】刪除資料庫中有，但 Excel 裡沒有的學生
+            existing_students = User.query.filter_by(role='student').all()
+            for db_student in existing_students:
+                if db_student.student_id not in excel_student_ids:
+                    db.session.delete(db_student)
+                    deleted_count += 1
 
-				student = User.query.filter_by(student_id=student_id_val, role='student').first()
-				if student:
-					# 動態寫入所有科目 (排除學號、姓名、Email等)
-					for col in df.columns:
-						if col not in ['學號', '姓名', 'Email', 'email'] and pd.notna(row.get(col)):
-							db.session.add(Score(student_id=student.id, exam_id=exam.id, subject=str(col), score=float(row.get(col))))
-		db.session.commit()
-		return jsonify({"msg": "多場考試匯入成功"}), 200
-	except Exception as e:
-		return jsonify({"msg": f"匯入失敗: {str(e)}"}), 500
+            # 先將學生名單 flush 到資料庫，以防後續成績找不到 user_id
+            db.session.flush()
 
+        # 步驟 2：處理各科考試的 Sheet
+        for sheet_name, df in sheets.items():
+            if sheet_name == '學生名單':
+                continue
+                
+            if '學號' not in df.columns:
+                return jsonify({"msg": f"工作表 '{sheet_name}' 缺少「學號」欄位，無法匯入成績"}), 400
+
+            exam = Exam.query.filter_by(name=sheet_name).first()
+            if not exam:
+                exam = Exam(name=sheet_name)
+                db.session.add(exam)
+                db.session.flush()
+            elif exam.is_locked:
+                continue
+            
+            Score.query.filter_by(exam_id=exam.id).delete()
+            
+            for _, row in df.iterrows():
+                student_id_val = str(row.get('學號', '')).strip()
+                if student_id_val.endswith('.0'): student_id_val = student_id_val[:-2]
+                if len(student_id_val) < 3 and student_id_val.isdigit(): student_id_val = student_id_val.zfill(3)
+
+                student = User.query.filter_by(student_id=student_id_val, role='student').first()
+                
+                # 容錯機制：如果老師沒上傳名單，但成績單裡有附上姓名與 Email，直接幫忙建檔
+                if not student:
+                    email_val = str(row.get('Email', row.get('email', ''))).strip()
+                    name_val = str(row.get('姓名', '')).strip()
+                    if email_val and name_val and not pd.isna(email_val) and not pd.isna(name_val):
+                        if not User.query.filter_by(email=email_val).first():
+                            student = User(student_id=student_id_val, email=email_val, name=name_val, role='student', is_verified=False)
+                            db.session.add(student)
+                            db.session.flush()
+                            total_upserted_students += 1
+                
+                if student:
+                    for col in df.columns:
+                        if col not in ['學號', '姓名', 'Email', 'email', '狀態'] and pd.notna(row.get(col)):
+                            try:
+                                score_val = float(row.get(col))
+                                db.session.add(Score(student_id=student.id, exam_id=exam.id, subject=str(col), score=score_val))
+                                total_inserted_scores += 1
+                            except ValueError:
+                                pass # 處理「缺考」或非數字字串
+
+        # 判斷加上 deleted_count
+        if total_inserted_scores == 0 and total_upserted_students == 0 and deleted_count == 0:
+            db.session.rollback()
+            return jsonify({"msg": "Excel 處理完畢，但未找到任何有效的學生或成績資料"}), 400
+
+        db.session.commit()
+        # 更新回傳訊息，讓前端顯示刪除人數
+        return jsonify({"msg": f"匯入成功！更新 {total_upserted_students} 位學生，移除 {deleted_count} 位舊生，寫入 {total_inserted_scores} 筆成績"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": f"檔案解析發生錯誤: {str(e)}"}), 500
 @app.route('/teacher/export-grades', methods=['GET'])
 @jwt_required()
 def export_grades():
-	if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
-	
-	exams = Exam.query.all()
-	output = io.BytesIO()
-	with pd.ExcelWriter(output, engine='openpyxl') as writer:
-		if not exams:
-			pd.DataFrame({"提示": ["尚無資料"]}).to_excel(writer, index=False, sheet_name='無資料')
-		else:
-			for exam in exams:
-				scores = Score.query.filter_by(exam_id=exam.id).all()
-				if not scores: continue
-				# 將成績轉為 DataFrame 並做 Pivot Table 展開科目
-				df = pd.DataFrame([{'學號': s.student.student_id, '姓名': s.student.name, 'Email': s.student.email, 'subject': s.subject, 'score': s.score} for s in scores])
-				pivot_df = df.pivot_table(index=['學號', '姓名', 'Email'], columns='subject', values='score', aggfunc='first').reset_index()
-				pivot_df.to_excel(writer, index=False, sheet_name=exam.name)
-	
-	output.seek(0)
-	return send_file(output, download_name='all_exams_grades.xlsx', as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # 1. 獨立匯出「學生名單」Sheet
+        students = User.query.filter_by(role='student').order_by(User.student_id).all()
+        if students:
+            df_students = pd.DataFrame([{
+                '學號': s.student_id, 
+                '姓名': s.name, 
+                'Email': s.email,
+                '狀態': '已開通' if s.is_verified else '未開通'
+            } for s in students])
+            df_students.to_excel(writer, index=False, sheet_name='學生名單')
+        else:
+            pd.DataFrame({"提示": ["系統尚無學生"]}).to_excel(writer, index=False, sheet_name='學生名單')
 
+        # 2. 匯出各科成績
+        exams = Exam.query.all()
+        for exam in exams:
+            scores = Score.query.filter_by(exam_id=exam.id).all()
+            if not scores: continue
+            df = pd.DataFrame([{
+                '學號': s.student.student_id, 
+                '姓名': s.student.name, 
+                'Email': s.student.email, 
+                'subject': s.subject, 
+                'score': s.score
+            } for s in scores])
+            pivot_df = df.pivot_table(index=['學號', '姓名', 'Email'], columns='subject', values='score', aggfunc='first').reset_index()
+            pivot_df.to_excel(writer, index=False, sheet_name=exam.name)
+    
+    output.seek(0)
+    return send_file(output, download_name='school_data_export.xlsx', as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 def init_db():
 	with app.app_context():
 		inspector = inspect(db.engine)
@@ -362,7 +456,63 @@ def init_db():
 
 			db.session.commit()
 			print("資料庫初始化完成")
+# ================= 獨立的學生名單管理 =================
 
+@app.route('/teacher/all-students', methods=['GET'])
+@jwt_required()
+def get_all_students():
+	if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
+	students = User.query.filter_by(role='student').all()
+	return jsonify([{
+		"id": s.id, 
+		"student_id": s.student_id, 
+		"name": s.name, 
+		"email": s.email, 
+		"is_verified": s.is_verified
+	} for s in students]), 200
+
+@app.route('/teacher/student', methods=['POST'])
+@jwt_required()
+def add_student():
+	if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
+	data = request.get_json()
+	
+	# 防呆 1：檢查必填欄位
+	if not data.get('student_id') or not data.get('email') or not data.get('name'):
+		return jsonify({"msg": "學號、姓名與 Email 皆為必填"}), 400
+
+	# 防呆 2：檢查重複
+	if User.query.filter_by(student_id=data.get('student_id')).first():
+		return jsonify({"msg": "此學號已存在系統中"}), 400
+	if User.query.filter_by(email=data.get('email')).first():
+		return jsonify({"msg": "此 Email 已被註冊"}), 400
+		
+	new_student = User(
+		student_id=data.get('student_id'),
+		email=data.get('email'),
+		name=data.get('name'),
+		role='student',
+		is_verified=False # 預設未驗證，需透過忘記密碼設定
+	)
+	db.session.add(new_student)
+	db.session.commit()
+	return jsonify({"msg": "學生新增成功"}), 200
+
+@app.route('/teacher/student/<int:student_id>', methods=['DELETE'])
+@jwt_required()
+def delete_student(student_id):
+	if get_jwt().get('role') != 'teacher': return jsonify({"msg": "權限不足"}), 403
+	student = User.query.get_or_404(student_id)
+	
+	# 防呆 3：檢查該學生是否有被「鎖定」的成績
+	# 關聯 Score 與 Exam，如果該學生有成績且該考試 is_locked=True，則拒絕刪除
+	locked_scores = Score.query.join(Exam).filter(Score.student_id == student.id, Exam.is_locked == True).first()
+	if locked_scores:
+		return jsonify({"msg": f"無法刪除！{student.name} 有參與已鎖定的考試，請先解鎖該考試才能刪除學生。"}), 400
+	
+	db.session.delete(student)
+	db.session.commit()
+	return jsonify({"msg": f"已成功刪除學生 {student.name} 及其所有未鎖定成績"}), 200
 if __name__ == '__main__':
 	init_db()
 	app.run(debug=True, port=5000)
